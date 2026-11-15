@@ -418,7 +418,7 @@ async def createkeys(
 @has_admin_or_role()
 async def createfreekey(interaction: discord.Interaction):
     keys_db = load_keys()
-    
+     
     random_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
     key_str = f"NoLimite-Free-{random_suffix}"
 
@@ -482,13 +482,13 @@ async def resethwid(interaction: discord.Interaction, key: str):
         )
 
 
-@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin")
+@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin m3a les details w l-performance ta3hom")
 @has_admin_or_role()
 async def listkeys(interaction: discord.Interaction):
     keys_db = load_keys()
     if not keys_db:
         await interaction.response.send_message(
-            "❌ Ma kayn 7ta key m-creyi.", ephemeral=True
+            "❌ Ma kayn 7ta key m-creyi f database.", ephemeral=True
         )
         return
 
@@ -496,13 +496,47 @@ async def listkeys(interaction: discord.Interaction):
     active_count = sum(1 for k in keys_db.values() if k.get("uses_count", 0) > 0)
 
     embed = discord.Embed(
-        title="📊 Keys Status",
-        description=(
-            f"Total: **{total}** | Msta3mlin: **{active_count}** | Ma zal:"
-            f" **{total - active_count}**"
-        ),
+        title="📊 Keys Status & Performance",
+        description=f"Total: **{total}** | Msta3mlin: **{active_count}** | Ma zal: **{total - active_count}**\n\n**Qaima dyal Les Keys:**",
         color=0x3B82F6,
     )
+
+    count_fields = 0
+    for key_str, data in list(keys_db.items()):
+        if count_fields >= 25:
+            embed.add_field(
+                name="⚠️ Notice", 
+                value="Kaynin keys khrin ma t-affichawch kamlin hit l-limit wselna l 25.", 
+                inline=False
+            )
+            break
+
+        uses = data.get("uses_count", 0)
+        max_uses = data.get("max_uses", "1")
+        duration = data.get("duration", "Lifetime")
+        expires = data.get("expires_at")
+        
+        if not expires:
+            status_time = f"Duration: {duration} (Not activated yet)"
+        elif expires == "Lifetime":
+            status_time = "Lifetime ♾️"
+        else:
+            status_time = f"Expires: {expires[:10]}"
+
+        field_value = (
+            f"• **Uses:** `{uses}/{max_uses}`\n"
+            f"• **Time:** {status_time}\n"
+            f"• **HWIDs:** {len(data.get('hwid_list', []))}"
+        )
+
+        embed.add_field(
+            name=f"🔑 {key_str}",
+            value=field_value,
+            inline=True
+        )
+        count_fields += 1
+
+    embed.set_footer(text="Security System • Keys Performance")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
