@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -8,6 +10,36 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify, request
+
+# --- HMAC SIGNING (anti fake-server) --------------------------------------
+# L'client (Security.h f main.cpp) ma yqbelch success=true bla signature.
+# Canonical (nfs li f sec::AuthCanonical C++):
+#     key|hwid|1or0|expiry|message
+# SECRET lazem ykoun HEWED b l'CRYPT_AUTO("NoLimite-Auth-Secret-2026")
+# li f main.cpp -> law beddelt wahda, beddelha hna nta 7ata (nfs l'value).
+AUTH_SECRET = "NoLimite-Auth-Secret-2026"
+
+
+def sign_response(resp: dict, raw_key: str, raw_hwid: str) -> dict:
+    """Yzid field "sig" (HMAC-SHA256) 3la l'response dyal /verify.
+
+    NFS l'valeurs li kay-7aseb bihom l'client (qra mn l'json:
+    expiry/message -> law machi string kay7sbehom "").
+    """
+    success = 1 if resp.get("success") else 0
+    expiry = resp.get("expiry")
+    expiry = expiry if isinstance(expiry, str) else ""
+    message = resp.get("message")
+    message = message if isinstance(message, str) else ""
+
+    canonical = f"{raw_key}|{raw_hwid}|{success}|{expiry}|{message}"
+    resp["sig"] = hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return resp
+# ---------------------------------------------------------------------------
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -67,8 +99,14 @@ def verify_key_api():
     user_key = request.args.get("key")
     user_hwid = request.args.get("hwid")
 
+    # raw values (qbel lstrip) -> hado li n-signiw bihom, nfs li
+    # l'client kay-7aseb fihom l'sig (key_str ki dakhaltou + hwid)
+    raw_key = user_key or ""
+    raw_hwid = user_hwid or ""
+
     if not user_key:
-        return jsonify({"success": False, "message": "No key provided"}), 400
+        return jsonify(sign_response(
+            {"success": False, "message": "No key provided"}, raw_key, raw_hwid)), 400
 
     user_key = user_key.strip()
     keys_db = load_keys()
@@ -88,7 +126,9 @@ def verify_key_api():
             try:
                 expire_date = datetime.fromisoformat(key_data["expires_at"])
                 if datetime.now() > expire_date:
-                    return jsonify({"success": False, "message": "Key expired! Please renew your key."})
+                    return jsonify(sign_response(
+                        {"success": False, "message": "Key expired! Please renew your key."},
+                        raw_key, raw_hwid))
             except Exception:
                 pass
 
@@ -97,18 +137,20 @@ def verify_key_api():
 
         # 2. Check if HWID is already registered (Re-login / Same PC)
         if user_hwid and user_hwid in hwid_list:
-            return jsonify({
+            return jsonify(sign_response({
                 "success": True,
                 "message": "Key activated successfully!",
                 "expiry": key_data.get("expires_at") or "Lifetime",
-            })
+            }, raw_key, raw_hwid))
 
         # 3. If it's a NEW HWID, check against Max Uses limit
         if not is_unlimited:
             try:
                 max_uses = int(max_uses_str)
                 if len(hwid_list) >= max_uses:
-                    return jsonify({"success": False, "message": "Key limit reached! Max uses exceeded."})
+                    return jsonify(sign_response(
+                        {"success": False, "message": "Key limit reached! Max uses exceeded."},
+                        raw_key, raw_hwid))
             except Exception:
                 pass
 
@@ -127,13 +169,14 @@ def verify_key_api():
         key_data["uses_count"] = len(hwid_list)
         save_keys(keys_db)
 
-        return jsonify({
+        return jsonify(sign_response({
             "success": True,
             "message": "Key activated successfully!",
             "expiry": key_data.get("expires_at") or "Lifetime",
-        })
+        }, raw_key, raw_hwid))
     else:
-        return jsonify({"success": False, "message": "Invalid key"})
+        return jsonify(sign_response(
+            {"success": False, "message": "Invalid key"}, raw_key, raw_hwid))
 
 
 def run_flask():
@@ -323,67 +366,6 @@ class DeleteKeyView(discord.ui.View):
         self.add_item(DeleteKeySelect(keys_dict))
 
 
-# --- SELECT MENU FOR VIEWING KEY DETAILS ---
-class ListKeysSelect(discord.ui.Select):
-    def __init__(self, keys_dict):
-        options = []
-        for key, data in list(keys_dict.items())[:25]:
-            uses = data.get("uses_count", 0)
-            max_u = data.get("max_uses", 1)
-            duration = data.get("duration", "Lifetime")
-            
-            label = key
-            desc = f"Duration: {duration} | Uses: {uses}/{max_u}"
-            
-            options.append(
-                discord.SelectOption(label=label, description=desc[:100], emoji="🔑")
-            )
-
-        super().__init__(
-            placeholder="Khtar Key men l-qaima bach tchouf details ta3ha...",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction):
-        selected_key = self.values[0]
-        keys_db = load_keys()
-        
-        if selected_key not in keys_db:
-            await interaction.response.send_message(f"❌ L-Key `{selected_key}` mal9inahch!", ephemeral=True)
-            return
-
-        k_data = keys_db[selected_key]
-        uses = k_data.get("uses_count", 0)
-        max_u = k_data.get("max_uses", 1)
-        duration = k_data.get("duration", "Lifetime")
-        expires = k_data.get("expires_at", "Not Activated Yet")
-        hwid_list = k_data.get("hwid_list", [])
-        users_list = k_data.get("users_list", [])
-
-        hwids_str = "\n".join([f"`{h}`" for h in hwid_list]) if hwid_list else "Ma kaynch HWID m-enregistré"
-        users_str = "\n".join([f"<@{u}> (`{u}`)" for u in users_list]) if users_list else "Ma kaynch Discord User msta3mlha"
-
-        embed = discord.Embed(
-            title=f"🔑 Key Details: {selected_key}",
-            color=0x3B82F6,
-        )
-        embed.add_field(name="⏳ Duration", value=str(duration), inline=True)
-        embed.add_field(name="📊 Uses", value=f"{uses} / {max_u}", inline=True)
-        embed.add_field(name="⏰ Expiry", value=str(expires), inline=False)
-        embed.add_field(name="💻 HWIDs Msta3mlin", value=hwids_str[:1024], inline=False)
-        embed.add_field(name="👤 Discord Users Msta3mlin", value=users_str[:1024], inline=False)
-
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-class ListKeysView(discord.ui.View):
-    def __init__(self, keys_dict):
-        super().__init__(timeout=60)
-        self.add_item(ListKeysSelect(keys_dict))
-
-
 # --- DISCORD BOT SETUP ---
 class AuthBot(commands.Bot):
     def __init__(self):
@@ -474,11 +456,12 @@ async def createkeys(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# --- COMMAND: CREATE FREE AUTOMATIC GLOBAL KEY (24h) ---
 @bot.tree.command(name="createfreekey", description="Crea Free Global Key t-khdem 24h w t-mshi 3nd ga3 n-nas")
 @has_admin_or_role()
 async def createfreekey(interaction: discord.Interaction):
     keys_db = load_keys()
-     
+    
     random_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
     key_str = f"NoLimite-Free-{random_suffix}"
 
@@ -542,13 +525,13 @@ async def resethwid(interaction: discord.Interaction, key: str):
         )
 
 
-@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin b kol details ta3hom")
+@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin")
 @has_admin_or_role()
 async def listkeys(interaction: discord.Interaction):
     keys_db = load_keys()
     if not keys_db:
         await interaction.response.send_message(
-            "❌ Ma kayn 7ta key m-creyi f database.", ephemeral=True
+            "❌ Ma kayn 7ta key m-creyi.", ephemeral=True
         )
         return
 
@@ -556,18 +539,14 @@ async def listkeys(interaction: discord.Interaction):
     active_count = sum(1 for k in keys_db.values() if k.get("uses_count", 0) > 0)
 
     embed = discord.Embed(
-        title="📊 Keys Database Overview",
+        title="📊 Keys Status",
         description=(
-            f"Total Keys: **{total}**\n"
-            f"Msta3mlin (Active): **{active_count}**\n"
-            f"Ma zalin (Unused): **{total - active_count}**\n\n"
-            "👇 **Khtar key men l-menu l-taht bach t-chouf l-HWID w les Discord Users li st3mlouha:**"
+            f"Total: **{total}** | Msta3mlin: **{active_count}** | Ma zal:"
+            f" **{total - active_count}**"
         ),
         color=0x3B82F6,
     )
-    
-    view = ListKeysView(keys_db)
-    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # --- RUNNING BOTH FLASK & BOT CONCURRENTLY ---
