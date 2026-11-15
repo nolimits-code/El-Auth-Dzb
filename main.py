@@ -1,6 +1,4 @@
 from datetime import datetime, timedelta
-import hashlib
-import hmac
 import json
 import os
 import random
@@ -10,36 +8,6 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from flask import Flask, jsonify, request
-
-# --- HMAC SIGNING (anti fake-server) --------------------------------------
-# L'client (Security.h f main.cpp) ma yqbelch success=true bla signature.
-# Canonical (nfs li f sec::AuthCanonical C++):
-#     key|hwid|1or0|expiry|message
-# SECRET lazem ykoun HEWED b l'CRYPT_AUTO("NoLimite-Auth-Secret-2026")
-# li f main.cpp -> law beddelt wahda, beddelha hna nta 7ata (nfs l'value).
-AUTH_SECRET = "NoLimite-Auth-Secret-2026"
-
-
-def sign_response(resp: dict, raw_key: str, raw_hwid: str) -> dict:
-    """Yzid field "sig" (HMAC-SHA256) 3la l'response dyal /verify.
-
-    NFS l'valeurs li kay-7aseb bihom l'client (qra mn l'json:
-    expiry/message -> law machi string kay7sbehom "").
-    """
-    success = 1 if resp.get("success") else 0
-    expiry = resp.get("expiry")
-    expiry = expiry if isinstance(expiry, str) else ""
-    message = resp.get("message")
-    message = message if isinstance(message, str) else ""
-
-    canonical = f"{raw_key}|{raw_hwid}|{success}|{expiry}|{message}"
-    resp["sig"] = hmac.new(
-        AUTH_SECRET.encode("utf-8"),
-        canonical.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-    return resp
-# ---------------------------------------------------------------------------
 
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
@@ -99,14 +67,8 @@ def verify_key_api():
     user_key = request.args.get("key")
     user_hwid = request.args.get("hwid")
 
-    # raw values (qbel lstrip) -> hado li n-signiw bihom, nfs li
-    # l'client kay-7aseb fihom l'sig (key_str ki dakhaltou + hwid)
-    raw_key = user_key or ""
-    raw_hwid = user_hwid or ""
-
     if not user_key:
-        return jsonify(sign_response(
-            {"success": False, "message": "No key provided"}, raw_key, raw_hwid)), 400
+        return jsonify({"success": False, "message": "No key provided"}), 400
 
     user_key = user_key.strip()
     keys_db = load_keys()
@@ -126,9 +88,7 @@ def verify_key_api():
             try:
                 expire_date = datetime.fromisoformat(key_data["expires_at"])
                 if datetime.now() > expire_date:
-                    return jsonify(sign_response(
-                        {"success": False, "message": "Key expired! Please renew your key."},
-                        raw_key, raw_hwid))
+                    return jsonify({"success": False, "message": "Key expired! Please renew your key."})
             except Exception:
                 pass
 
@@ -137,20 +97,18 @@ def verify_key_api():
 
         # 2. Check if HWID is already registered (Re-login / Same PC)
         if user_hwid and user_hwid in hwid_list:
-            return jsonify(sign_response({
+            return jsonify({
                 "success": True,
                 "message": "Key activated successfully!",
                 "expiry": key_data.get("expires_at") or "Lifetime",
-            }, raw_key, raw_hwid))
+            })
 
         # 3. If it's a NEW HWID, check against Max Uses limit
         if not is_unlimited:
             try:
                 max_uses = int(max_uses_str)
                 if len(hwid_list) >= max_uses:
-                    return jsonify(sign_response(
-                        {"success": False, "message": "Key limit reached! Max uses exceeded."},
-                        raw_key, raw_hwid))
+                    return jsonify({"success": False, "message": "Key limit reached! Max uses exceeded."})
             except Exception:
                 pass
 
@@ -169,14 +127,13 @@ def verify_key_api():
         key_data["uses_count"] = len(hwid_list)
         save_keys(keys_db)
 
-        return jsonify(sign_response({
+        return jsonify({
             "success": True,
             "message": "Key activated successfully!",
             "expiry": key_data.get("expires_at") or "Lifetime",
-        }, raw_key, raw_hwid))
+        })
     else:
-        return jsonify(sign_response(
-            {"success": False, "message": "Invalid key"}, raw_key, raw_hwid))
+        return jsonify({"success": False, "message": "Invalid key"})
 
 
 def run_flask():
