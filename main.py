@@ -2,7 +2,6 @@ from datetime import datetime, timedelta
 import json
 import os
 import random
-import sqlite3
 import string
 import threading
 import discord
@@ -13,93 +12,28 @@ from flask import Flask, jsonify, request
 # --- CONFIGURATION ---
 TOKEN = os.environ.get("DISCORD_TOKEN")
 GUILD_ID = 1520249103903100979
-VERIFIED_ROLE_ID = 1570807337806209207  # Updated verification role ID
+VERIFIED_ROLE_ID = 1570807337806209207  # Updated to the new verification role ID
 REQUIRED_ADMIN_ROLE_ID = 1570762871107883039  # Required role to manage keys/setup
-DB_FILE = "keys.db"
+KEYS_FILE = "keys.json"
 
 # --- FLASK API INITIALIZATION ---
 app = Flask(__name__)
 
 
-# --- DATABASE INITIALIZATION (SQLite) ---
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS keys (
-            key_str TEXT PRIMARY KEY,
-            uses_count INTEGER,
-            max_uses TEXT,
-            duration TEXT,
-            hwid_list TEXT,
-            users_list TEXT,
-            expires_at TEXT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
-
-init_db()
-
-
+# --- DATABASE FUNCTIONS (JSON) ---
 def load_keys():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM keys")
-    rows = cursor.fetchall()
-    conn.close()
-
-    keys_dict = {}
-    for row in rows:
-        key_str, uses_count, max_uses, duration, hwid_list, users_list, expires_at = row
-        keys_dict[key_str] = {
-            "uses_count": uses_count,
-            "max_uses": max_uses,
-            "duration": duration,
-            "hwid_list": json.loads(hwid_list) if hwid_list else [],
-            "users_list": json.loads(users_list) if users_list else [],
-            "expires_at": expires_at if expires_at else None,
-        }
-    return keys_dict
+    if not os.path.exists(KEYS_FILE):
+        return {}
+    with open(KEYS_FILE, "r") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
 
 
-def save_key(key_str, data):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute(
-        """
-        INSERT OR REPLACE INTO keys (key_str, uses_count, max_uses, duration, hwid_list, users_list, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-    """,
-        (
-            key_str,
-            data.get("uses_count", 0),
-            str(data.get("max_uses", "1")),
-            data.get("duration", "Lifetime"),
-            json.dumps(data.get("hwid_list", [])),
-            json.dumps(data.get("users_list", [])),
-            data.get("expires_at"),
-        ),
-    )
-    conn.commit()
-    conn.close()
-
-
-def delete_key_from_db(key_str):
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM keys WHERE key_str = ?", (key_str,))
-    conn.commit()
-    conn.close()
-
-
-def clear_all_keys():
-    conn = sqlite3.connect(DB_FILE)
-    cursor = conn.cursor()
-    cursor.execute("DELETE FROM keys")
-    conn.commit()
-    conn.close()
+def save_keys(keys_dict):
+    with open(KEYS_FILE, "w") as f:
+        json.dump(keys_dict, f, indent=4)
 
 
 # --- PARSE DURATION FUNCTION ---
@@ -184,14 +118,14 @@ def verify_key_api():
             key_data["hwid_list"] = hwid_list
 
         # 5. Set expiry time on first successful activation
-        if not key_data.get("expires_at") or key_data.get("expires_at"] == "":
+        if not key_data.get("expires_at") or key_data.get("expires_at") == "":
             duration_str = key_data.get("duration", "Lifetime")
             expiry = calculate_expiry(duration_str)
             key_data["expires_at"] = "Lifetime" if expiry == "Lifetime" or expiry is None else expiry.isoformat()
 
         # Update uses count based on unique HWIDs registered
         key_data["uses_count"] = len(hwid_list)
-        save_key(matched_key, key_data)
+        save_keys(keys_db)
 
         return jsonify({
             "success": True,
@@ -292,7 +226,7 @@ class AuthModal(discord.ui.Modal, title="🔐 System Authentication"):
                     expiry = calculate_expiry(duration_str)
                     key_data["expires_at"] = "Lifetime" if expiry == "Lifetime" or expiry is None else expiry.isoformat()
 
-                save_key(matched_key, key_data)
+                save_keys(keys_db)
 
                 embed = discord.Embed(
                     title="✅ Authentication Successful",
@@ -362,17 +296,18 @@ class DeleteKeySelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction):
         selected_value = self.values[0]
+        keys_db = load_keys()
 
         if selected_value == "DELETE_ALL_KEYS_OPTION":
-            clear_all_keys()
+            save_keys({})
             await interaction.response.send_message(
                 "⚠️ T-supprimaw **Ga3** les keys men database b naja7!",
                 ephemeral=True,
             )
         else:
-            keys_db = load_keys()
             if selected_value in keys_db:
-                delete_key_from_db(selected_value)
+                del keys_db[selected_value]
+                save_keys(keys_db)
                 await interaction.response.send_message(
                     f"✅ T-supprima l-Key b naja7: `{selected_value}`", ephemeral=True
                 )
@@ -445,6 +380,7 @@ async def createkeys(
         )
         return
 
+    keys_db = load_keys()
     new_keys = []
 
     for _ in range(count):
@@ -453,7 +389,7 @@ async def createkeys(
         )
         key_str = f"NoLimite-{random_suffix}"
 
-        key_data = {
+        keys_db[key_str] = {
             "uses_count": 0,
             "max_uses": max_uses,
             "duration": duration,
@@ -461,8 +397,9 @@ async def createkeys(
             "users_list": [],
             "expires_at": None,
         }
-        save_key(key_str, key_data)
         new_keys.append(key_str)
+
+    save_keys(keys_db)
 
     keys_text = "\n".join([f"`{k}`" for k in new_keys])
     if len(keys_text) > 1900:
@@ -476,13 +413,16 @@ async def createkeys(
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+# --- COMMAND: CREATE FREE AUTOMATIC GLOBAL KEY (24h) ---
 @bot.tree.command(name="createfreekey", description="Crea Free Global Key t-khdem 24h w t-mshi 3nd ga3 n-nas")
 @has_admin_or_role()
 async def createfreekey(interaction: discord.Interaction):
+    keys_db = load_keys()
+    
     random_suffix = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
     key_str = f"NoLimite-Free-{random_suffix}"
 
-    key_data = {
+    keys_db[key_str] = {
         "uses_count": 0,
         "max_uses": "Global",
         "duration": "24h",
@@ -491,7 +431,7 @@ async def createfreekey(interaction: discord.Interaction):
         "expires_at": None,
     }
 
-    save_key(key_str, key_data)
+    save_keys(keys_db)
 
     embed = discord.Embed(
         title="🎁 Free Global Key Created (24h)",
@@ -532,7 +472,7 @@ async def resethwid(interaction: discord.Interaction, key: str):
         keys_db[key]["hwid_list"] = []
         keys_db[key]["uses_count"] = 0
         keys_db[key]["users_list"] = []
-        save_key(key, keys_db[key])
+        save_keys(keys_db)
         await interaction.response.send_message(
             f"✅ HWID w Uses t-resetlhom l-key: `{key}` b naja7!", ephemeral=True
         )
@@ -542,13 +482,13 @@ async def resethwid(interaction: discord.Interaction, key: str):
         )
 
 
-@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin m3a les details w l-performance ta3hom")
+@bot.tree.command(name="listkeys", description="Chouf les keys li kaynin")
 @has_admin_or_role()
 async def listkeys(interaction: discord.Interaction):
     keys_db = load_keys()
     if not keys_db:
         await interaction.response.send_message(
-            "❌ Ma kayn 7ta key m-creyi f database.", ephemeral=True
+            "❌ Ma kayn 7ta key m-creyi.", ephemeral=True
         )
         return
 
@@ -556,47 +496,13 @@ async def listkeys(interaction: discord.Interaction):
     active_count = sum(1 for k in keys_db.values() if k.get("uses_count", 0) > 0)
 
     embed = discord.Embed(
-        title="📊 Keys Status & Performance",
-        description=f"Total: **{total}** | Msta3mlin: **{active_count}** | Ma zal: **{total - active_count}**\n\n**Qaima dyal Les Keys:**",
+        title="📊 Keys Status",
+        description=(
+            f"Total: **{total}** | Msta3mlin: **{active_count}** | Ma zal:"
+            f" **{total - active_count}**"
+        ),
         color=0x3B82F6,
     )
-
-    count_fields = 0
-    for key_str, data in list(keys_db.items()):
-        if count_fields >= 25:
-            embed.add_field(
-                name="⚠️ Notice", 
-                value="Kaynin keys khrin ma t-affichawch kamlin hit l-limit wselna l 25.", 
-                inline=False
-            )
-            break
-
-        uses = data.get("uses_count", 0)
-        max_uses = data.get("max_uses", "1")
-        duration = data.get("duration", "Lifetime")
-        expires = data.get("expires_at")
-        
-        if not expires:
-            status_time = f"Duration: {duration} (Not activated yet)"
-        elif expires == "Lifetime":
-            status_time = "Lifetime ♾️"
-        else:
-            status_time = f"Expires: {expires[:10]}"
-
-        field_value = (
-            f"• **Uses:** `{uses}/{max_uses}`\n"
-            f"• **Time:** {status_time}\n"
-            f"• **HWIDs:** {len(data.get('hwid_list', []))}"
-        )
-
-        embed.add_field(
-            name=f"🔑 {key_str}",
-            value=field_value,
-            inline=True
-        )
-        count_fields += 1
-
-    embed.set_footer(text="Security System • Keys Performance")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
