@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta
+import hashlib
+import hmac
 import json
 import os
 import random
@@ -15,6 +17,15 @@ GUILD_ID = 1520249103903100979
 VERIFIED_ROLE_ID = 1570807337806209207  # Updated to the new verification role ID
 REQUIRED_ADMIN_ROLE_ID = 1570762871107883039  # Required role to manage keys/setup
 KEYS_FILE = "keys.json"
+
+# Render (wela ay hosting) kay-sift l'app port via env PORT -> lazem n-bindiw 3lih.
+# 5000 hna ghir l'default dyal local. 9bel, port 5000 mthabet -> Render 502.
+PORT = int(os.environ.get("PORT", 5000))
+
+# Secret lazem ykoun HEWED b l'secret li f main.cpp (sec::HmacSha256Hex)
+# SIGN_RESPONSES=0 law bghiti t3eddi ghir l-auth bla sig (escape hatch).
+AUTH_SECRET = "NoLimite-Auth-Secret-2026"
+SIGN_RESPONSES = os.environ.get("SIGN_RESPONSES", "1") != "0"
 
 # --- FLASK API INITIALIZATION ---
 app = Flask(__name__)
@@ -61,14 +72,49 @@ def calculate_expiry(duration_str):
     return None
 
 
+# --- HMAC SIGNING (nfs l-canonical li f sec::AuthCanonical C++) ---
+def sign_auth_response(key: str, hwid: str, success: bool,
+                       expiry: str, message: str) -> str:
+    canonical = f"{key}|{hwid}|{1 if success else 0}|{expiry}|{message}"
+    return hmac.new(
+        AUTH_SECRET.encode("utf-8"),
+        canonical.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def auth_json(payload: dict, raw_key: str = "", raw_hwid: str = ""):
+    """Kol response tzid "sig" -> l'client kay-verifiwha (anti fake-server).
+    NFS l'valeurs li t-signiw lazem ykounou hwa li kayn f l'json
+    (l'client kay-7aseb l'sig 3la 7sab chnow qra mn l'response)."""
+    if SIGN_RESPONSES:
+        success = bool(payload.get("success", False))
+        expiry = payload.get("expiry")
+        expiry_s = expiry if isinstance(expiry, str) else ""
+        message = payload.get("message")
+        message_s = message if isinstance(message, str) else ""
+        payload["sig"] = sign_auth_response(raw_key, raw_hwid, success,
+                                            expiry_s, message_s)
+    return jsonify(payload)
+
+
+# --- HEALTH CHECK (Render health check path = "/") ---
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "ok", "service": "NoLimite Auth"})
+
+
 # --- FLASK API ENDPOINT ---
 @app.route("/verify", methods=["GET"])
 def verify_key_api():
-    user_key = request.args.get("key")
-    user_hwid = request.args.get("hwid")
+    raw_key = request.args.get("key") or ""
+    raw_hwid = request.args.get("hwid") or ""
+    user_key = raw_key
+    user_hwid = raw_hwid
 
     if not user_key:
-        return jsonify({"success": False, "message": "No key provided"}), 400
+        return auth_json({"success": False, "message": "No key provided"},
+                         raw_key, raw_hwid), 400
 
     user_key = user_key.strip()
     keys_db = load_keys()
@@ -88,7 +134,8 @@ def verify_key_api():
             try:
                 expire_date = datetime.fromisoformat(key_data["expires_at"])
                 if datetime.now() > expire_date:
-                    return jsonify({"success": False, "message": "Key expired! Please renew your key."})
+                    return auth_json({"success": False, "message": "Key expired! Please renew your key."},
+                                     raw_key, raw_hwid)
             except Exception:
                 pass
 
@@ -97,18 +144,19 @@ def verify_key_api():
 
         # 2. Check if HWID is already registered (Re-login / Same PC)
         if user_hwid and user_hwid in hwid_list:
-            return jsonify({
+            return auth_json({
                 "success": True,
                 "message": "Key activated successfully!",
                 "expiry": key_data.get("expires_at") or "Lifetime",
-            })
+            }, raw_key, raw_hwid)
 
         # 3. If it's a NEW HWID, check against Max Uses limit
         if not is_unlimited:
             try:
                 max_uses = int(max_uses_str)
                 if len(hwid_list) >= max_uses:
-                    return jsonify({"success": False, "message": "Key limit reached! Max uses exceeded."})
+                    return auth_json({"success": False, "message": "Key limit reached! Max uses exceeded."},
+                                     raw_key, raw_hwid)
             except Exception:
                 pass
 
@@ -127,17 +175,18 @@ def verify_key_api():
         key_data["uses_count"] = len(hwid_list)
         save_keys(keys_db)
 
-        return jsonify({
+        return auth_json({
             "success": True,
             "message": "Key activated successfully!",
             "expiry": key_data.get("expires_at") or "Lifetime",
-        })
+        }, raw_key, raw_hwid)
     else:
-        return jsonify({"success": False, "message": "Invalid key"})
+        return auth_json({"success": False, "message": "Invalid key"},
+                         raw_key, raw_hwid)
 
 
 def run_flask():
-    app.run(host="0.0.0.0", port=5000, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 # --- CUSTOM PERMISSION CHECK ---
@@ -508,9 +557,20 @@ async def listkeys(interaction: discord.Interaction):
 
 # --- RUNNING BOTH FLASK & BOT CONCURRENTLY ---
 if __name__ == "__main__":
-    flask_thread = threading.Thread(target=run_flask)
-    flask_thread.daemon = True
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    print("[+] Flask API started on http://localhost:5000")
+    print(f"[+] Flask API started on http://0.0.0.0:{PORT}")
 
-    bot.run(TOKEN)
+    # DISCORD_TOKEN ma kaynch -> ma n-qtlouch l'process (Flask lazem ybqa
+    # khdem bach l'client (main.cpp) y-verifiwi l'keys). Ghi l'slash
+    # commands hadi ghadi ma ykhdemouch ghir had l'merra.
+    if not TOKEN:
+        print("[-] DISCORD_TOKEN ma kaynch f l'env -> l'Discord bot ma y-bdach."
+              " Flask API ghadi ykhdem 3adi.")
+        flask_thread.join()
+    else:
+        try:
+            bot.run(TOKEN)
+        except Exception as e:
+            print(f"[-] Discord bot crashed: {e} -> Flask API ghadi ybqa khdem.")
+            flask_thread.join()
